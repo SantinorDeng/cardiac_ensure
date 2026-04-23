@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from cardiac_ensure.datasets import CardiacCineENSUREDataset
-from cardiac_ensure.losses.ensure_loss import estimate_divergence_mc
+from cardiac_ensure.losses.ensure_loss import estimate_divergence_mc, estimate_measurement_divergence_mc
 from cardiac_ensure.ops.cg_solver import solve_rho_ls, solve_weighted_projection
 from cardiac_ensure.ops.mri_ops import (
     dynamic_a_adjoint,
@@ -46,6 +46,20 @@ def _high_frequency_probe(reference: torch.Tensor, scale: float = 0.1) -> torch.
     checker = checker.to(reference.device)[None, None, ...].expand(reference.shape[0], 1, height, width)
     amplitude = float(scale) * torch.mean(torch.abs(reference)).detach()
     return amplitude * checker.to(reference.dtype)
+
+
+def _complex_trace_aah(maps: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if maps.ndim == 3:
+        coil_power = torch.mean(torch.abs(maps) ** 2, dim=(-2, -1)).sum()
+        sampled = mask[:, 0].sum(dim=(-2, -1)) if mask.ndim == 4 else mask.sum(dim=(-2, -1))
+        return sampled.sum() * coil_power
+    if maps.ndim == 4:
+        coil_power = torch.mean(torch.abs(maps) ** 2, dim=(-2, -1)).sum(dim=1)
+        if mask.ndim != 5:
+            raise ValueError(f"Batched measurement trace expects mask [B, T, 1, H, W], got {tuple(mask.shape)}")
+        sampled = mask[:, :, 0].sum(dim=(-2, -1))
+        return sampled.sum(dim=1) * coil_power
+    raise ValueError(f"Unsupported maps shape {tuple(maps.shape)}")
 
 
 def _load_sample(args: argparse.Namespace) -> Dict[str, torch.Tensor]:
@@ -222,6 +236,32 @@ def run_c4(sample: Dict[str, torch.Tensor]) -> Dict[str, float]:
     }
 
 
+def run_c5(sample: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    alpha = 0.35
+    linear_fn = lambda x: alpha * x
+    analytic = 2.0 * alpha * _complex_trace_aah(sample["maps"], sample["mask"])
+
+    div = estimate_measurement_divergence_mc(
+        model_fn=linear_fn,
+        inputs=sample["zf"],
+        kspace=sample["kspace_us"],
+        maps=sample["maps"],
+        mask=sample["mask"],
+        eps=None,
+        num_mc_samples=8,
+    )
+
+    estimated = div["divergence"]
+    analytic_mean = analytic.mean()
+    return {
+        "analytic_trace": float(analytic_mean),
+        "divergence_estimate": float(estimated),
+        "relative_error": float(torch.abs(estimated - analytic_mean) / torch.clamp(torch.abs(analytic_mean), min=1e-8)),
+        "divergence_finite": float(torch.isfinite(estimated)),
+        "auto_eps_value": float(div["eps"]),
+    }
+
+
 def evaluate_acceptance(results: Dict[str, Dict[str, float]]) -> Dict[str, bool]:
     return {
         "C1": (
@@ -248,6 +288,10 @@ def evaluate_acceptance(results: Dict[str, Dict[str, float]]) -> Dict[str, bool]
             results["C4"]["divergence_finite"] == 1.0
             and results["C4"]["auto_eps_relative_error"] < 5e-2
             and results["C4"]["large_eps_relative_error"] < 1e-1
+        ),
+        "C5": (
+            results["C5"]["divergence_finite"] == 1.0
+            and results["C5"]["relative_error"] < 7.5e-2
         ),
     }
 
@@ -282,6 +326,7 @@ def main() -> int:
         "C2": run_c2(sample, args),
         "C3": run_c3(sample, args),
         "C4": run_c4(sample),
+        "C5": run_c5(sample),
     }
     acceptance = evaluate_acceptance(results)
     payload = {

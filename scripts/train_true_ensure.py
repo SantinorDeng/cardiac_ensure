@@ -139,8 +139,52 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--cg-tol", type=float, default=1e-6)
     parser.add_argument("--divergence-eps", type=float, default=None)
     parser.add_argument("--divergence-mc-samples", type=int, default=1)
+    parser.add_argument("--divergence-mode", choices=("measurement", "image"), default="measurement")
+    parser.add_argument("--no-divergence-projection", action="store_true")
+    parser.add_argument("--save-step-debug", action="store_true")
+    parser.add_argument("--step-debug-limit", type=int, default=None)
     parser.add_argument("--compute-val-risk", action="store_true")
     return parser
+
+
+def _extract_step_diagnostics(
+    model: TemporalNormUnet,
+    loss_dict: Dict[str, torch.Tensor],
+    step_idx: int,
+) -> Dict[str, float | int | list[float]]:
+    div_per_sample = loss_dict.get("divergence_per_sample")
+    if div_per_sample is not None:
+        div_per_sample_real = torch.as_tensor(div_per_sample).detach().real.reshape(-1)
+        div_min = float(div_per_sample_real.min())
+        div_max = float(div_per_sample_real.max())
+        div_mean = float(div_per_sample_real.mean())
+    else:
+        div_min = float("nan")
+        div_max = float("nan")
+        div_mean = float("nan")
+
+    dc_weights = [
+        float(block.dc_weight_value().detach().cpu())
+        for block in getattr(model, "dc_blocks", [])
+        if hasattr(block, "dc_weight_value")
+    ]
+    diagnostics: Dict[str, float | int | list[float]] = {
+        "step": int(step_idx),
+        "loss": float(loss_dict["loss"].detach()),
+        "data_term": float(loss_dict["data_term"].detach()),
+        "div_term": float(loss_dict["div_term"].detach()),
+        "div_scale": float(loss_dict["div_scale"].detach()),
+        "div_contribution": float(loss_dict["div_contribution"].detach()),
+        "divergence_eps": float(loss_dict["divergence_eps"].detach()),
+        "divergence_per_sample_min": div_min,
+        "divergence_per_sample_max": div_max,
+        "divergence_per_sample_mean": div_mean,
+        "dc_weights": dc_weights,
+    }
+    if dc_weights:
+        diagnostics["dc_weight_min"] = min(dc_weights)
+        diagnostics["dc_weight_max"] = max(dc_weights)
+    return diagnostics
 
 
 def _make_dataset(
@@ -202,6 +246,8 @@ def _compute_train_loss(
         cg_tol=args.cg_tol,
         divergence_eps=args.divergence_eps,
         divergence_mc_samples=args.divergence_mc_samples,
+        divergence_mode=getattr(args, "divergence_mode", "measurement"),
+        project_divergence=not getattr(args, "no_divergence_projection", False),
     )
 
 
@@ -215,6 +261,14 @@ def train_one_epoch(
     model.train()
     stats = RunningStats()
     observed_target_in_train = False
+    step_diagnostics: list[Dict[str, Any]] = []
+    div_term_min: float | None = None
+    div_term_max: float | None = None
+    div_eps_min: float | None = None
+    div_eps_max: float | None = None
+    dc_weight_min: float | None = None
+    dc_weight_max: float | None = None
+    negative_div_steps = 0
 
     progress = tqdm(loader, desc="train", leave=False)
     for step_idx, batch in enumerate(progress):
@@ -237,13 +291,33 @@ def train_one_epoch(
         loss_value = float(loss.detach())
         data_term_value = float(loss_dict["data_term"].detach())
         div_term_value = float(loss_dict["div_term"].detach())
+        div_scale_value = float(loss_dict["div_scale"].detach())
         div_contribution_value = float(loss_dict["div_contribution"].detach())
         risk_proxy_value = float(loss_dict["risk_proxy"].detach())
+        diagnostics = _extract_step_diagnostics(model=model, loss_dict=loss_dict, step_idx=step_idx)
+        div_eps_value = float(diagnostics["divergence_eps"])
+        div_term_min = div_term_value if div_term_min is None else min(div_term_min, div_term_value)
+        div_term_max = div_term_value if div_term_max is None else max(div_term_max, div_term_value)
+        div_eps_min = div_eps_value if div_eps_min is None else min(div_eps_min, div_eps_value)
+        div_eps_max = div_eps_value if div_eps_max is None else max(div_eps_max, div_eps_value)
+        negative_div_steps += int(div_term_value < 0.0)
+        if "dc_weight_min" in diagnostics:
+            value = float(diagnostics["dc_weight_min"])
+            dc_weight_min = value if dc_weight_min is None else min(dc_weight_min, value)
+        if "dc_weight_max" in diagnostics:
+            value = float(diagnostics["dc_weight_max"])
+            dc_weight_max = value if dc_weight_max is None else max(dc_weight_max, value)
+        if getattr(args, "save_step_debug", False) and (
+            getattr(args, "step_debug_limit", None) is None
+            or len(step_diagnostics) < int(args.step_debug_limit)
+        ):
+            step_diagnostics.append(diagnostics)
         stats.update(
             {
                 "loss": loss_value,
                 "data_term": data_term_value,
                 "div_term": div_term_value,
+                "div_scale": div_scale_value,
                 "div_contribution": div_contribution_value,
                 "risk_proxy": risk_proxy_value,
             }
@@ -254,12 +328,21 @@ def train_one_epoch(
             data=f"{data_term_value:.6f}",
             div=f"{div_term_value:.6f}",
             divc=f"{div_contribution_value:.6f}",
+            eps=f"{div_eps_value:.2e}",
             refresh=False,
         )
 
     out = stats.averages()
     out["num_steps"] = stats.count
     out["observed_target_in_train"] = float(observed_target_in_train)
+    out["train_div_term_min"] = float("nan") if div_term_min is None else div_term_min
+    out["train_div_term_max"] = float("nan") if div_term_max is None else div_term_max
+    out["train_negative_div_steps"] = negative_div_steps
+    out["train_divergence_eps_min"] = float("nan") if div_eps_min is None else div_eps_min
+    out["train_divergence_eps_max"] = float("nan") if div_eps_max is None else div_eps_max
+    out["train_dc_weight_min"] = float("nan") if dc_weight_min is None else dc_weight_min
+    out["train_dc_weight_max"] = float("nan") if dc_weight_max is None else dc_weight_max
+    out["step_diagnostics"] = step_diagnostics
     return out
 
 
@@ -300,6 +383,7 @@ def validate(
                         "val_risk_proxy": float(loss_dict["risk_proxy"]),
                         "val_data_term": float(loss_dict["data_term"]),
                         "val_div_term": float(loss_dict["div_term"]),
+                        "val_div_scale": float(loss_dict["div_scale"]),
                         "val_div_contribution": float(loss_dict["div_contribution"]),
                     }
                 )
@@ -352,6 +436,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     save_json(output_dir / "config.json", config)
 
     history: list[Dict[str, Any]] = []
+    debug_history: list[Dict[str, Any]] = []
     best_val_nmse = float("inf")
 
     for epoch_idx in range(args.epochs):
@@ -363,6 +448,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             "train_loss": train_stats["loss"],
             "train_data_term": train_stats["data_term"],
             "train_div_term": train_stats["div_term"],
+            "train_div_scale": train_stats["div_scale"],
             "train_div_contribution": train_stats["div_contribution"],
             "train_risk_proxy": train_stats["risk_proxy"],
             "val_nmse": val_stats["nmse"],
@@ -379,14 +465,34 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             epoch_record["val_risk_proxy"] = val_stats["val_risk_proxy"]
             epoch_record["val_data_term"] = val_stats["val_data_term"]
             epoch_record["val_div_term"] = val_stats["val_div_term"]
+            epoch_record["val_div_scale"] = val_stats["val_div_scale"]
             epoch_record["val_div_contribution"] = val_stats["val_div_contribution"]
+        for key in (
+            "train_div_term_min",
+            "train_div_term_max",
+            "train_negative_div_steps",
+            "train_divergence_eps_min",
+            "train_divergence_eps_max",
+            "train_dc_weight_min",
+            "train_dc_weight_max",
+        ):
+            epoch_record[key] = train_stats[key]
         history.append(epoch_record)
+        if getattr(args, "save_step_debug", False):
+            debug_history.append(
+                {
+                    "epoch": epoch_idx,
+                    "train_steps": train_stats["num_steps"],
+                    "step_diagnostics": train_stats.get("step_diagnostics", []),
+                }
+            )
 
         print(
             f"[true-ensure] epoch={epoch_idx} "
             f"train_loss={epoch_record['train_loss']:.6f} "
             f"train_risk={epoch_record['train_risk_proxy']:.6f} "
-            f"val_nmse={epoch_record['val_nmse']:.6f}"
+            f"val_nmse={epoch_record['val_nmse']:.6f} "
+            f"neg_div_steps={int(epoch_record['train_negative_div_steps'])}"
         )
 
         if val_stats["nmse"] < best_val_nmse:
@@ -413,6 +519,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             )
 
         save_json(output_dir / "history.json", {"history": history, "best_val_nmse": best_val_nmse})
+        if getattr(args, "save_step_debug", False):
+            save_json(output_dir / "debug_history.json", {"history": debug_history, "best_val_nmse": best_val_nmse})
 
     summary = {
         "best_val_nmse": best_val_nmse,

@@ -156,7 +156,12 @@ class SoftDataConsistency(nn.Module):
 
     def __init__(self, init_weight: float = 1.0) -> None:
         super().__init__()
-        self.dc_weight = nn.Parameter(torch.tensor(float(init_weight), dtype=torch.float32))
+        init = min(max(float(init_weight), 1e-4), 1.0 - 1e-4)
+        raw_init = math.log(init / (1.0 - init))
+        self.dc_weight = nn.Parameter(torch.tensor(raw_init, dtype=torch.float32))
+
+    def dc_weight_value(self) -> torch.Tensor:
+        return torch.sigmoid(self.dc_weight)
 
     def forward(
         self,
@@ -169,7 +174,8 @@ class SoftDataConsistency(nn.Module):
             return image
 
         normal = dynamic_a_normal(image, maps, mask)
-        return image - self.dc_weight.to(device=image.device, dtype=image.real.dtype) * (normal - reference_image)
+        dc_weight = self.dc_weight_value().to(device=image.device, dtype=image.real.dtype)
+        return image - dc_weight * (normal - reference_image)
 
 
 def extract_center_frame(x: torch.Tensor, temporal_dim: int = 1) -> torch.Tensor:
@@ -218,7 +224,7 @@ class TemporalNormUnet(nn.Module):
             drop_prob=drop_prob,
         )
         self.dc_blocks = nn.ModuleList(
-            [SoftDataConsistency(init_weight=1.0) for _ in range(self.num_unrolls)]
+            [SoftDataConsistency(init_weight=0.99) for _ in range(self.num_unrolls)]
         )
 
     def _canonicalize_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, bool, bool]:

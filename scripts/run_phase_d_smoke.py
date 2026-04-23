@@ -87,6 +87,10 @@ def main(argv: list[str] | None = None) -> int:
         cg_tol=1e-6,
         divergence_eps=None,
         divergence_mc_samples=1,
+        divergence_mode="measurement",
+        no_divergence_projection=False,
+        save_step_debug=False,
+        step_debug_limit=None,
         compute_val_risk=True,
     )
 
